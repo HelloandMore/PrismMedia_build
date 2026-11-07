@@ -279,6 +279,7 @@ namespace
                 "  set release_window_us <1000..5000000>\n"
                 "  fallback <auto|on|off>\n"
                 "  route <status|on|off|retrain>\n"
+                "  route scan <status|strict|broad|wide|slot 0..15>\n"
                 "  route candidates\n"
                 "  route preview <candidate> [3..60 seconds] | route preview off\n"
                 "  route select <candidate> | route clear\n"
@@ -514,13 +515,14 @@ namespace
                 return "OK Per-display route " + action + " accepted.";
             }
             if (action == "candidates" || action == "preview" ||
-                action == "select" || action == "clear")
+                action == "select" || action == "clear" ||
+                action == "scan")
             {
                 std::string rest;
                 std::getline(input, rest);
                 return per_draw_router::command(action + rest);
             }
-            return "ERROR Use route status/on/off/retrain/candidates, "
+            return "ERROR Use route status/on/off/retrain/candidates/scan, "
                 "route preview/select, or route clear.";
         }
         if (verb == "run")

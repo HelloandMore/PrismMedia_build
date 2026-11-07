@@ -1,0 +1,70 @@
+{
+  "format": 1,
+  "restore": {
+    "C:\\Users\\Milaan\\Desktop\\Scripts\\PrismMedia_build\\PrismMediaClient\\PrismMediaClient.csproj": {}
+  },
+  "projects": {
+    "C:\\Users\\Milaan\\Desktop\\Scripts\\PrismMedia_build\\PrismMediaClient\\PrismMediaClient.csproj": {
+      "version": "1.0.0",
+      "restore": {
+        "projectUniqueName": "C:\\Users\\Milaan\\Desktop\\Scripts\\PrismMedia_build\\PrismMediaClient\\PrismMediaClient.csproj",
+        "projectName": "PrismMediaClient",
+        "projectPath": "C:\\Users\\Milaan\\Desktop\\Scripts\\PrismMedia_build\\PrismMediaClient\\PrismMediaClient.csproj",
+        "packagesPath": "C:\\Users\\Milaan\\.nuget\\packages\\",
+        "outputPath": "C:\\Users\\Milaan\\Desktop\\Scripts\\PrismMedia_build\\PrismMediaClient\\obj\\",
+        "projectStyle": "PackageReference",
+        "configFilePaths": [
+          "C:\\Users\\Milaan\\AppData\\Roaming\\NuGet\\NuGet.Config"
+        ],
+        "originalTargetFrameworks": [
+          "net48"
+        ],
+        "sources": {
+          "https://api.nuget.org/v3/index.json": {}
+        },
+        "frameworks": {
+          "net48": {
+            "framework": "net48",
+            "targetAlias": "net48",
+            "projectReferences": {}
+          }
+        },
+        "warningProperties": {
+          "warnAsError": [
+            "NU1605"
+          ]
+        },
+        "restoreAuditProperties": {
+          "enableAudit": "true",
+          "auditLevel": "low",
+          "auditMode": "direct"
+        },
+        "SdkAnalysisLevel": "10.0.400"
+      },
+      "frameworks": {
+        "net48": {
+          "framework": "net48",
+          "targetAlias": "net48",
+          "dependencies": {
+            "Microsoft.NETFramework.ReferenceAssemblies": {
+              "suppressParent": "All",
+              "target": "Package",
+              "version": "[1.0.3, )",
+              "autoReferenced": true
+            },
+            "Microsoft.Web.WebView2": {
+              "target": "Package",
+              "version": "[1.0.4078.44, )"
+            }
+          },
+          "runtimeIdentifierGraphPath": "C:\\Program Files\\dotnet\\sdk\\10.0.401\\RuntimeIdentifierGraph.json"
+        }
+      },
+      "runtimes": {
+        "win-x64": {
+          "#import": []
+        }
+      }
+    }
+  }
+}

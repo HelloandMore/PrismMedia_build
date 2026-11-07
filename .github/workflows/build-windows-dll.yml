@@ -15,6 +15,10 @@ jobs:
       - name: Validate runtime diagnostic host
         shell: powershell
         run: |
+          cl /nologo /EHsc /std:c++17 tests\final_draw_discovery_test.cpp /Fe:final-draw-discovery-test.exe
+          if ($LASTEXITCODE -ne 0) { throw 'Final-draw filter compilation failed' }
+          & .\final-draw-discovery-test.exe
+          if ($LASTEXITCODE -ne 0) { throw 'Final-draw filter tests failed' }
           cl /nologo /EHsc /std:c++17 tests\diagnostic_options_test.cpp /Fe:diagnostic-options-test.exe
           if ($LASTEXITCODE -ne 0) { throw 'Options test compilation failed' }
           & .\diagnostic-options-test.exe
@@ -68,6 +72,7 @@ jobs:
           Copy-Item 'PER-DISPLAY-ROUTING.md' $Package
           Copy-Item 'COMPOSITOR-TRACE-REVISION.md' $Package
           Copy-Item 'FINAL-DRAW-ROUTING.md' $Package
+          Copy-Item 'SCREEN-DISCOVERY-PATCH.md' $Package
           Copy-Item 'PICKER-CRASH-FIX.md' $Package
           Copy-Item 'OWNER-MAPPER.md' $Package
           @"

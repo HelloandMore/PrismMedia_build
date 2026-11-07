@@ -130,6 +130,9 @@
     <ClInclude Include="per_draw_router.h">
       <Filter>Source Files</Filter>
     </ClInclude>
+    <ClInclude Include="final_draw_discovery.h">
+      <Filter>Source Files</Filter>
+    </ClInclude>
     <ClInclude Include="engine_standby.h">
       <Filter>Source Files</Filter>
     </ClInclude>

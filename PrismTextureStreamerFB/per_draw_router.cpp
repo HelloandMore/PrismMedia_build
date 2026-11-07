@@ -2,6 +2,7 @@
 #include "per_draw_router.h"
 
 #include "custom_render_probe.h"
+#include "final_draw_discovery.h"
 #include "addon_display_probe.h"
 #include "diagnostic_log.h"
 #include "dx11/CreateTexture2D.h"
@@ -25,12 +26,14 @@ namespace
     constexpr uint64_t kTrainingTimeoutMs = 12000;
     constexpr uint32_t kStableObservationCount = 3;
     constexpr size_t kMaximumIntermediates = 16;
-    constexpr size_t kMaximumCandidates = 64;
+    constexpr size_t kMaximumCandidates = 256;
+    constexpr size_t kMaximumCandidatesPerSlot = 24;
+    constexpr UINT kAllDiscoverySlots = 16;
+    constexpr unsigned kBroadSampleMask = 3; // inspect one in four eligible draws
+    constexpr uint64_t kBroadTrainingTimeoutMs = 16000;
     // Confirmed in the ETS2 1.62 RenderDoc capture: both addon GPS surfaces
     // sample independent 1024x1024 R8G8B8A8_SRGB targets from PS slot 6.
     constexpr UINT kFinalDrawSourceSlot = 6;
-    constexpr UINT kFinalDrawWidth = 1024;
-    constexpr UINT kFinalDrawHeight = 1024;
     constexpr uint64_t kPreviewMinimumMs = 3000;
     constexpr uint64_t kPreviewMaximumMs = 60000;
     constexpr uint64_t kCandidateSettleMs = 500;
@@ -119,6 +122,13 @@ namespace
     bool g_hooksTraining{};
     per_draw_router::draw_kind_t g_hookKind{ per_draw_router::draw_kind_t::none };
     bool g_forceRetrain{};
+    // Strict is the original safe default. Exploration is explicitly selected
+    // in the diagnostic console; neither discovery mode auto-selects textures.
+    final_draw_discovery::mode_t g_discoveryMode{
+        final_draw_discovery::mode_t::strict };
+    UINT g_discoverySlot{ kAllDiscoverySlots };
+    bool g_ignorePersistedSelector{};
+    std::atomic<uint64_t> g_broadSamples{};
     stable_selector_t g_savedSelector;
 	std::vector<draw_signature_t> g_previewSignatures;
     std::vector<draw_signature_t> g_pickerProbeSignatures;
@@ -227,6 +237,7 @@ namespace
         g_directObservations = 0;
         g_derivedObservations = 0;
         g_finalDrawObservations = 0;
+        g_broadSamples.store(0, std::memory_order_relaxed);
 		g_previewSignatures.clear();
         g_previewDeadline = 0;
         g_previewIndex = 0;
@@ -401,14 +412,13 @@ namespace
         }
         resource->Release();
 
-        const bool rgbaResource = format == DXGI_FORMAT_R8G8B8A8_TYPELESS ||
-            format == DXGI_FORMAT_R8G8B8A8_UNORM ||
-            format == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
-        const bool rgbaView = viewDescription.Format == DXGI_FORMAT_UNKNOWN ||
-            viewDescription.Format == DXGI_FORMAT_R8G8B8A8_UNORM ||
-            viewDescription.Format == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
-        return identity != 0 && width == kFinalDrawWidth &&
-            height == kFinalDrawHeight && rgbaResource && rgbaView;
+        // Kept for compatibility with the original strict slot-6 detector.
+        // The broadened detector validates view dimensions and bind flags too.
+        return identity != 0 && final_draw_discovery::eligible_source(
+            final_draw_discovery::mode_t::strict, kFinalDrawSourceSlot,
+            width, height, static_cast<unsigned>(format),
+            static_cast<unsigned>(viewDescription.Format),
+            static_cast<unsigned>(viewDescription.ViewDimension), 0);
     }
 
     bool selector_matches(
@@ -564,30 +574,69 @@ namespace
         }
     }
 
-    void observe_native_final_draw_locked(
+    void register_final_draw_locked(
         ID3D11DeviceContext* context,
-        const per_draw_router::draw_call_t& call)
+        const per_draw_router::draw_call_t& call,
+        UINT slot,
+        ID3D11ShaderResourceView* view)
     {
-        if (call.kind != per_draw_router::draw_kind_t::indexed)
-            return;
-
-        ID3D11ShaderResourceView* view{};
-        context->PSGetShaderResources(kFinalDrawSourceSlot, 1, &view);
+        if (!view) return;
         UINT width{}, height{};
         DXGI_FORMAT format{ DXGI_FORMAT_UNKNOWN };
         uintptr_t identity{};
-        const bool matches = describe_final_draw_source(
-            view, width, height, format, identity);
-        if (view) view->Release();
-        if (!matches) return;
 
+        // Strict mode uses its unchanged original predicate. Broad mode checks
+        // the real resource AND view format, shader visibility and dimensions.
+        if (g_discoveryMode == final_draw_discovery::mode_t::strict)
+        {
+            if (!describe_final_draw_source(view, width, height, format, identity))
+                return;
+        }
+        else
+        {
+            D3D11_SHADER_RESOURCE_VIEW_DESC viewDesc{};
+            view->GetDesc(&viewDesc);
+            ID3D11Resource* resource{};
+            view->GetResource(&resource);
+            if (!resource) return;
+            ID3D11Texture2D* texture{};
+            D3D11_TEXTURE2D_DESC desc{};
+            if (SUCCEEDED(resource->QueryInterface(
+                    __uuidof(ID3D11Texture2D),
+                    reinterpret_cast<void**>(&texture))) && texture)
+            {
+                texture->GetDesc(&desc);
+                texture->Release();
+            }
+            const bool eligible = final_draw_discovery::eligible_source(
+                g_discoveryMode, slot, desc.Width, desc.Height,
+                static_cast<unsigned>(desc.Format),
+                static_cast<unsigned>(viewDesc.Format),
+                static_cast<unsigned>(viewDesc.ViewDimension), desc.BindFlags);
+            if (eligible)
+            {
+                IUnknown* canonical{};
+                if (SUCCEEDED(resource->QueryInterface(__uuidof(IUnknown),
+                    reinterpret_cast<void**>(&canonical))) && canonical)
+                {
+                    identity = reinterpret_cast<uintptr_t>(canonical);
+                    canonical->Release();
+                }
+                width = desc.Width;
+                height = desc.Height;
+                format = desc.Format;
+            }
+            resource->Release();
+            if (!eligible || !identity) return;
+        }
+
+        // Each candidate is a *possible* draw; no media is injected during
+        // discovery. Only the existing visual/manual picker can authorize it.
         addon_display_probe::observe_final_draw(identity);
-
         const draw_signature_t signature = capture_signature(
-            context, call, kFinalDrawSourceSlot, identity);
+            context, call, slot, identity);
         if (!signature.valid) return;
         ++g_finalDrawObservations;
-
         auto found = std::find_if(
             g_candidates.begin(), g_candidates.end(),
             [&signature](const candidate_t& item) {
@@ -597,17 +646,71 @@ namespace
         if (found == g_candidates.end())
         {
             if (g_candidates.size() >= kMaximumCandidates) return;
+            const size_t fromSlot = static_cast<size_t>(std::count_if(
+                g_candidates.begin(), g_candidates.end(),
+                [slot](const candidate_t& item) {
+                    return item.signature.sourceSlot == slot;
+                }));
+            if (g_discoveryMode != final_draw_discovery::mode_t::strict &&
+                fromSlot >= kMaximumCandidatesPerSlot) return;
             g_candidates.push_back(
                 { signature, 1, width, height, format, true });
             g_candidateChangedTick = GetTickCount64();
         }
         else
         {
-            ++found->hits;
+            if (found->hits < UINT32_MAX) ++found->hits;
             if (found->hits == kStableObservationCount)
                 g_candidateChangedTick = GetTickCount64();
         }
         restore_saved_selector_if_unique_locked();
+    }
+
+    void observe_native_final_draw_locked(
+        ID3D11DeviceContext* context,
+        const per_draw_router::draw_call_t& call)
+    {
+        // Continue using only the DrawIndexed detour during discovery.
+        if (call.kind != per_draw_router::draw_kind_t::indexed) return;
+        if (g_discoveryMode != final_draw_discovery::mode_t::strict &&
+            GetTickCount64() - g_trainingStarted > kBroadTrainingTimeoutMs)
+            return;
+        if (g_discoveryMode == final_draw_discovery::mode_t::strict)
+        {
+            ID3D11ShaderResourceView* view{};
+            context->PSGetShaderResources(kFinalDrawSourceSlot, 1, &view);
+            register_final_draw_locked(context, call, kFinalDrawSourceSlot, view);
+            if (view) view->Release();
+            return;
+        }
+        if (!final_draw_discovery::potential_draw(
+                g_discoveryMode, call.count)) return;
+
+        // This temporary broad search has much higher D3D state-query cost.
+        // Sample at most one quarter of plausible indexed draws, and disable
+        // all new queries when training ends. Preview/active mode remains exact.
+        if ((g_broadSamples.fetch_add(1, std::memory_order_relaxed) &
+                kBroadSampleMask) != 0) return;
+        if (g_discoverySlot < kAllDiscoverySlots)
+        {
+            ID3D11ShaderResourceView* view{};
+            context->PSGetShaderResources(g_discoverySlot, 1, &view);
+            register_final_draw_locked(context, call, g_discoverySlot, view);
+            if (view) view->Release();
+            return;
+        }
+
+        ID3D11ShaderResourceView* views[kAllDiscoverySlots]{};
+        context->PSGetShaderResources(0, kAllDiscoverySlots, views);
+        // Put the original GPS slot first so its candidates cannot be starved
+        // by unrelated textures in earlier slots.
+        register_final_draw_locked(context, call, 6, views[6]);
+        for (UINT slot = 0; slot < kAllDiscoverySlots; ++slot)
+        {
+            if (slot == 6) continue;
+            register_final_draw_locked(context, call, slot, views[slot]);
+        }
+        for (auto* view : views) if (view) view->Release();
     }
 
     bool bind_custom_view_locked(
@@ -925,7 +1028,8 @@ namespace per_draw_router
         if (changed)
         {
             g_forceRetrain = false;
-			g_savedSelector = persistedSelector;
+			g_savedSelector = g_ignorePersistedSelector
+                ? stable_selector_t{} : persistedSelector;
             release_target_locked();
             g_targetTexture = texture;
             texture = nullptr;
@@ -967,7 +1071,9 @@ namespace per_draw_router
             else
             {
                 set_phase_locked(phase_t::training);
-                g_detail = "Discovering independent 1024x1024 GPS final draws at PS slot 6.";
+                g_detail = g_discoveryMode == final_draw_discovery::mode_t::strict
+                    ? "Discovering independent 1024x1024 GPS final draws at PS slot 6."
+                    : "Exploratory screen discovery: preview/select a candidate before any replacement.";
                 // Training no longer relies on the version-specific global
                 // branch, so native GPS/smartphone displays remain untouched.
                 custom_render_probe::set_fallback_mode(
@@ -1018,7 +1124,9 @@ namespace per_draw_router
 				static_cast<unsigned long long>(g_routeSignatures.size()));
         }
         else if (g_phase == phase_t::training &&
-            GetTickCount64() - g_trainingStarted >= kTrainingTimeoutMs)
+            GetTickCount64() - g_trainingStarted >=
+                (g_discoveryMode == final_draw_discovery::mode_t::strict
+                    ? kTrainingTimeoutMs : kBroadTrainingTimeoutMs))
         {
             const bool hasFinalDrawCandidate = std::any_of(
                 g_candidates.begin(), g_candidates.end(),
@@ -1059,8 +1167,9 @@ namespace per_draw_router
                         custom_render_probe::fallback_mode_t::forced_off);
                     diagnostic_log::write(
                         "error",
-                        "Per-display router found no stable 1024x1024 slot-6 GPS "
-                        "draw within 12 seconds; original displays were retained.");
+                        g_discoveryMode == final_draw_discovery::mode_t::strict
+                        ? "Per-display router found no stable 1024x1024 slot-6 GPS draw within 12 seconds; original displays were retained."
+                        : "Exploratory screen discovery found no stable candidate; original displays were retained. Try route scan slot <n> or route scan wide.");
                 }
             }
         }
@@ -1084,7 +1193,13 @@ namespace per_draw_router
     {
         std::lock_guard<std::mutex> lock(g_mutex);
         std::ostringstream detail;
-        detail << phase_name(g_phase) << ": " << g_detail;
+        detail << phase_name(g_phase) << ": " << g_detail
+            << " scan=" << (g_discoveryMode == final_draw_discovery::mode_t::strict
+                ? "strict" : (g_discoveryMode == final_draw_discovery::mode_t::wide
+                    ? "wide" : "broad"));
+        if (g_discoveryMode != final_draw_discovery::mode_t::strict)
+            detail << " slot=" << (g_discoverySlot == kAllDiscoverySlots
+                ? "all" : std::to_string(g_discoverySlot));
         if (g_phase == phase_t::training || g_phase == phase_t::fallback)
         {
             detail << " traceDirect=" << g_directObservations
@@ -1128,6 +1243,56 @@ namespace per_draw_router
             });
 
         std::unique_lock<std::mutex> lock(g_mutex);
+        if (action == "scan")
+        {
+            std::string selection, extra;
+            input >> selection;
+            if (selection == "status" && !(input >> extra))
+                return std::string("OK scan=") +
+                    (g_discoveryMode == final_draw_discovery::mode_t::strict
+                        ? "strict" : (g_discoveryMode == final_draw_discovery::mode_t::wide
+                            ? "wide" : "broad")) + " slot=" +
+                    (g_discoverySlot == kAllDiscoverySlots
+                        ? "all" : std::to_string(g_discoverySlot));
+            final_draw_discovery::mode_t mode = g_discoveryMode;
+            UINT slot = kAllDiscoverySlots;
+            if (selection == "strict") mode = final_draw_discovery::mode_t::strict;
+            else if (selection == "broad") mode = final_draw_discovery::mode_t::broad;
+            else if (selection == "wide") mode = final_draw_discovery::mode_t::wide;
+            else if (selection == "slot")
+            {
+                std::string token;
+                if (!(input >> token))
+                    return "ERROR Use route scan slot <0..15>.";
+                try
+                {
+                    size_t used{};
+                    const auto parsed = std::stoul(token, &used, 10);
+                    if (used != token.size() || parsed >= kAllDiscoverySlots)
+                        return "ERROR Slot must be 0..15.";
+                    slot = static_cast<UINT>(parsed);
+                }
+                catch (...) { return "ERROR Slot must be 0..15."; }
+                mode = final_draw_discovery::mode_t::broad;
+            }
+            else
+                return "ERROR Use route scan strict|broad|wide|slot <0..15>|status.";
+            if (input >> extra)
+                return "ERROR Use route scan strict|broad|wide|slot <0..15>|status.";
+            g_discoveryMode = mode;
+            g_discoverySlot = slot;
+            g_ignorePersistedSelector = mode != final_draw_discovery::mode_t::strict;
+            g_savedSelector = {};
+            g_forceRetrain = true;
+            const std::string slotName = slot == kAllDiscoverySlots
+                ? "all" : std::to_string(slot);
+            diagnostic_log::writef("route",
+                "Screen discovery mode set to %s, slot %s; preview/selection required.",
+                mode == final_draw_discovery::mode_t::strict ? "strict"
+                    : (mode == final_draw_discovery::mode_t::wide ? "wide" : "broad"),
+                slotName.c_str());
+            return "OK Screen discovery mode changed. Keep one Custom display active; run route status after the discovery window, then route candidates or the visual picker. No native texture will be replaced before selection.";
+        }
         if (action.empty() || action == "candidates")
         {
             std::ostringstream rows;

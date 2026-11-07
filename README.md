@@ -1,3 +1,9 @@
+> **Experimental ETS2 1.62 screen-discovery compatibility patch:** This source adds
+> an opt-in `route scan broad` / `route scan wide` mode for Scania dashboards
+> that are not recognized by the original slot-6 RGBA8 filter. It is not
+> in-game validated; it never substitutes media without preview/selection.
+> See [SCREEN-DISCOVERY-PATCH.md](SCREEN-DISCOVERY-PATCH.md) for build and tests.
+
 # PrismMedia 4.0.0
 
 ## Visual truck-screen picker revision
